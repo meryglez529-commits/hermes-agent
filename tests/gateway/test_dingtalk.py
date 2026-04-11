@@ -80,32 +80,31 @@ class TestDingTalkAdapterInit:
 
 class TestExtractText:
 
-    def test_extracts_dict_text(self):
+    def test_extracts_text_content_object(self):
+        # SDK 0.24+: message.text is a TextContent object with .content attribute
         from gateway.platforms.dingtalk import DingTalkAdapter
+        text_obj = MagicMock()
+        text_obj.content = "  hello world  "
         msg = MagicMock()
-        msg.text = {"content": "  hello world  "}
-        msg.rich_text = None
+        msg.text = text_obj
+        msg.rich_text_content = None
         assert DingTalkAdapter._extract_text(msg) == "hello world"
 
-    def test_extracts_string_text(self):
+    def test_falls_back_to_rich_text_content(self):
+        # SDK 0.24+: rich text lives in message.rich_text_content.rich_text_list
         from gateway.platforms.dingtalk import DingTalkAdapter
+        rich_obj = MagicMock()
+        rich_obj.rich_text_list = [{"text": "part1"}, {"text": "part2"}, {"image": "url"}]
         msg = MagicMock()
-        msg.text = "plain text"
-        msg.rich_text = None
-        assert DingTalkAdapter._extract_text(msg) == "plain text"
-
-    def test_falls_back_to_rich_text(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
-        msg = MagicMock()
-        msg.text = ""
-        msg.rich_text = [{"text": "part1"}, {"text": "part2"}, {"image": "url"}]
+        msg.text = None
+        msg.rich_text_content = rich_obj
         assert DingTalkAdapter._extract_text(msg) == "part1 part2"
 
     def test_returns_empty_for_no_content(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = MagicMock()
-        msg.text = ""
-        msg.rich_text = None
+        msg.text = None
+        msg.rich_text_content = None
         assert DingTalkAdapter._extract_text(msg) == ""
 
 
@@ -270,36 +269,27 @@ class TestConnect:
 
 class TestExtractDownloadCode:
 
-    def test_extracts_from_content_dict(self):
+    def test_extracts_from_image_content_object(self):
+        # SDK 0.24+: message.image_content is an ImageContent object with .download_code
         from gateway.platforms.dingtalk import DingTalkAdapter
+        image_content = MagicMock()
+        image_content.download_code = "abc123"
         msg = MagicMock()
-        msg.content = {"downloadCode": "abc123"}
-        msg.picture_download_code = None
-        msg.text = {}
+        msg.image_content = image_content
         assert DingTalkAdapter._extract_download_code(msg) == "abc123"
 
-    def test_extracts_from_picture_download_code_attr(self):
+    def test_returns_none_when_image_content_is_none(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = MagicMock()
-        msg.content = {}
-        msg.picture_download_code = "pdc456"
-        msg.text = {}
-        assert DingTalkAdapter._extract_download_code(msg) == "pdc456"
+        msg.image_content = None
+        assert DingTalkAdapter._extract_download_code(msg) is None
 
-    def test_extracts_from_text_dict_fallback(self):
+    def test_returns_none_when_download_code_is_none(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
+        image_content = MagicMock()
+        image_content.download_code = None
         msg = MagicMock()
-        msg.content = {}
-        msg.picture_download_code = None
-        msg.text = {"downloadCode": "txt789"}
-        assert DingTalkAdapter._extract_download_code(msg) == "txt789"
-
-    def test_returns_none_when_missing(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
-        msg = MagicMock()
-        msg.content = {}
-        msg.picture_download_code = None
-        msg.text = {}
+        msg.image_content = image_content
         assert DingTalkAdapter._extract_download_code(msg) is None
 
 
