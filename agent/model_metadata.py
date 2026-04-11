@@ -101,7 +101,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     "gpt-5": 128000,
     "gpt-4": 128000,
     # Google
-    "gemini": 1048576,
+    "gemini": 1500000,
     # Gemma (open models served via AI Studio)
     "gemma-4-31b": 256000,
     "gemma-4-26b": 256000,

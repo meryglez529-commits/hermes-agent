@@ -264,6 +264,227 @@ class TestConnect:
 
 
 # ---------------------------------------------------------------------------
+# Image: _extract_download_code
+# ---------------------------------------------------------------------------
+
+
+class TestExtractDownloadCode:
+
+    def test_extracts_from_content_dict(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = MagicMock()
+        msg.content = {"downloadCode": "abc123"}
+        msg.picture_download_code = None
+        msg.text = {}
+        assert DingTalkAdapter._extract_download_code(msg) == "abc123"
+
+    def test_extracts_from_picture_download_code_attr(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = MagicMock()
+        msg.content = {}
+        msg.picture_download_code = "pdc456"
+        msg.text = {}
+        assert DingTalkAdapter._extract_download_code(msg) == "pdc456"
+
+    def test_extracts_from_text_dict_fallback(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = MagicMock()
+        msg.content = {}
+        msg.picture_download_code = None
+        msg.text = {"downloadCode": "txt789"}
+        assert DingTalkAdapter._extract_download_code(msg) == "txt789"
+
+    def test_returns_none_when_missing(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = MagicMock()
+        msg.content = {}
+        msg.picture_download_code = None
+        msg.text = {}
+        assert DingTalkAdapter._extract_download_code(msg) is None
+
+
+# ---------------------------------------------------------------------------
+# Image: access token
+# ---------------------------------------------------------------------------
+
+
+class TestAccessToken:
+
+    @pytest.mark.asyncio
+    async def test_fetches_token_on_first_call(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(
+            enabled=True, extra={"client_id": "kid", "client_secret": "sec"}
+        ))
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"accessToken": "tok-1", "expireIn": 7200}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        adapter._http_client = mock_client
+
+        token = await adapter._get_access_token()
+        assert token == "tok-1"
+        mock_client.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reuses_cached_token(self):
+        import time
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._access_token = "cached-tok"
+        adapter._token_expires_at = time.time() + 3600
+        mock_client = AsyncMock()
+        adapter._http_client = mock_client
+
+        token = await adapter._get_access_token()
+        assert token == "cached-tok"
+        mock_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_api_error(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=Exception("network error"))
+        adapter._http_client = mock_client
+
+        token = await adapter._get_access_token()
+        assert token is None
+
+
+# ---------------------------------------------------------------------------
+# Image: _download_image
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadImage:
+
+    @pytest.mark.asyncio
+    async def test_downloads_and_caches_image(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        # Stub token fetch
+        adapter._get_access_token = AsyncMock(return_value="tok-abc")
+
+        mock_resp = MagicMock()
+        mock_resp.content = b"\xff\xd8\xff" + b"\x00" * 100  # fake JPEG bytes
+        mock_resp.headers = {"content-type": "image/jpeg"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        adapter._http_client = mock_client
+
+        with patch("gateway.platforms.dingtalk.cache_image_from_bytes", return_value="/cache/img.jpg") as mock_cache:
+            result = await adapter._download_image("code-xyz")
+
+        assert result == "/cache/img.jpg"
+        mock_cache.assert_called_once_with(mock_resp.content, ext=".jpg")
+
+    @pytest.mark.asyncio
+    async def test_returns_none_without_token(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._get_access_token = AsyncMock(return_value=None)
+        adapter._http_client = AsyncMock()
+
+        result = await adapter._download_image("code-xyz")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_download_error(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._get_access_token = AsyncMock(return_value="tok")
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=Exception("timeout"))
+        adapter._http_client = mock_client
+
+        result = await adapter._download_image("code-xyz")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Image: inbound picture message handling
+# ---------------------------------------------------------------------------
+
+
+class TestPictureMessageHandling:
+
+    @pytest.mark.asyncio
+    async def test_picture_message_populates_media_urls(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._download_image = AsyncMock(return_value="/cache/photo.jpg")
+
+        received_events = []
+        async def fake_handle(event):
+            received_events.append(event)
+        adapter.handle_message = fake_handle
+
+        msg = MagicMock()
+        msg.message_id = "pic-001"
+        msg.message_type = "picture"
+        msg.text = ""
+        msg.rich_text = None
+        msg.content = {"downloadCode": "dl-code-1"}
+        msg.picture_download_code = None
+        msg.conversation_id = "conv-1"
+        msg.conversation_type = "1"
+        msg.sender_id = "user-1"
+        msg.sender_nick = "Alice"
+        msg.sender_staff_id = ""
+        msg.session_webhook = "https://hook.example/1"
+        msg.conversation_title = None
+        msg.create_at = None
+
+        await adapter._on_message(msg)
+
+        assert len(received_events) == 1
+        event = received_events[0]
+        assert event.message_type == MessageType.PHOTO
+        assert event.media_urls == ["/cache/photo.jpg"]
+        assert event.media_types == ["image/jpeg"]
+
+    @pytest.mark.asyncio
+    async def test_picture_message_dispatched_even_if_download_fails(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._download_image = AsyncMock(return_value=None)
+
+        received_events = []
+        async def fake_handle(event):
+            received_events.append(event)
+        adapter.handle_message = fake_handle
+
+        msg = MagicMock()
+        msg.message_id = "pic-002"
+        msg.message_type = "picture"
+        msg.text = ""
+        msg.rich_text = None
+        msg.content = {"downloadCode": "dl-code-2"}
+        msg.picture_download_code = None
+        msg.conversation_id = "conv-2"
+        msg.conversation_type = "1"
+        msg.sender_id = "user-2"
+        msg.sender_nick = "Bob"
+        msg.sender_staff_id = ""
+        msg.session_webhook = "https://hook.example/2"
+        msg.conversation_title = None
+        msg.create_at = None
+
+        await adapter._on_message(msg)
+
+        # Still dispatched, but with empty media_urls
+        assert len(received_events) == 1
+        assert received_events[0].message_type == MessageType.PHOTO
+        assert received_events[0].media_urls == []
+
+
+# ---------------------------------------------------------------------------
 # Platform enum
 # ---------------------------------------------------------------------------
 

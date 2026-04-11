@@ -46,6 +46,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_image_from_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,12 @@ MAX_MESSAGE_LENGTH = 20000
 DEDUP_WINDOW_SECONDS = 300
 DEDUP_MAX_SIZE = 1000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+
+# DingTalk OpenAPI endpoints
+_DINGTALK_TOKEN_URL = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
+_DINGTALK_DOWNLOAD_URL = "https://api.dingtalk.com/v1.0/robot/messageFiles/download"
+# Access token TTL is 7200s; refresh 5 minutes early
+_TOKEN_REFRESH_BUFFER = 300
 
 
 def check_dingtalk_requirements() -> bool:
@@ -91,6 +98,11 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Map chat_id -> session_webhook for reply routing
         self._session_webhooks: Dict[str, str] = {}
 
+        # Access token cache: (token, expires_at)
+        self._access_token: Optional[str] = None
+        self._token_expires_at: float = 0.0
+        self._token_lock: asyncio.Lock = asyncio.Lock()
+
     # -- Connection lifecycle -----------------------------------------------
 
     async def connect(self) -> bool:
@@ -111,9 +123,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             credential = dingtalk_stream.Credential(self._client_id, self._client_secret)
             self._stream_client = dingtalk_stream.DingTalkStreamClient(credential)
 
-            # Capture the current event loop for cross-thread dispatch
-            loop = asyncio.get_running_loop()
-            handler = _IncomingHandler(self, loop)
+            handler = _IncomingHandler(self)
             self._stream_client.register_callback_handler(
                 dingtalk_stream.ChatbotMessage.TOPIC, handler
             )
@@ -127,12 +137,12 @@ class DingTalkAdapter(BasePlatformAdapter):
             return False
 
     async def _run_stream(self) -> None:
-        """Run the blocking stream client with auto-reconnection."""
+        """Run the stream client with auto-reconnection."""
         backoff_idx = 0
         while self._running:
             try:
                 logger.debug("[%s] Starting stream client...", self.name)
-                await asyncio.to_thread(self._stream_client.start)
+                await self._stream_client.start()
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -168,7 +178,78 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._stream_client = None
         self._session_webhooks.clear()
         self._seen_messages.clear()
+        self._access_token = None
+        self._token_expires_at = 0.0
         logger.info("[%s] Disconnected", self.name)
+
+    # -- Access token management --------------------------------------------
+
+    async def _get_access_token(self) -> Optional[str]:
+        """Return a valid access token, refreshing if necessary."""
+        async with self._token_lock:
+            now = time.time()
+            if self._access_token and now < self._token_expires_at - _TOKEN_REFRESH_BUFFER:
+                return self._access_token
+
+            if not self._http_client:
+                logger.error("[%s] HTTP client not initialized, cannot fetch access token", self.name)
+                return None
+
+            try:
+                resp = await self._http_client.post(
+                    _DINGTALK_TOKEN_URL,
+                    json={"appKey": self._client_id, "appSecret": self._client_secret},
+                    timeout=10.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                self._access_token = data.get("accessToken")
+                expires_in = data.get("expireIn", 7200)
+                self._token_expires_at = now + expires_in
+                logger.debug("[%s] Access token refreshed, expires in %ds", self.name, expires_in)
+                return self._access_token
+            except Exception as e:
+                logger.error("[%s] Failed to fetch access token: %s", self.name, e)
+                return None
+
+    # -- Image download -----------------------------------------------------
+
+    async def _download_image(self, download_code: str) -> Optional[str]:
+        """Download a DingTalk image by downloadCode and cache it locally.
+
+        Returns the local file path, or None on failure.
+        """
+        token = await self._get_access_token()
+        if not token:
+            logger.warning("[%s] Cannot download image: no access token", self.name)
+            return None
+
+        if not self._http_client:
+            return None
+
+        try:
+            resp = await self._http_client.post(
+                _DINGTALK_DOWNLOAD_URL,
+                headers={"x-acs-dingtalk-access-token": token},
+                json={"downloadCode": download_code, "robotCode": self._client_id},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            # The API returns the raw image bytes directly
+            image_bytes = resp.content
+            if not image_bytes:
+                logger.warning("[%s] Empty image response for downloadCode %s", self.name, download_code[:20])
+                return None
+            # Detect extension from Content-Type header
+            content_type = resp.headers.get("content-type", "image/jpeg")
+            ext = _content_type_to_ext(content_type)
+            cached_path = cache_image_from_bytes(image_bytes, ext=ext)
+            logger.info("[%s] Cached image at %s (%d bytes)", self.name, cached_path, len(image_bytes))
+            return cached_path
+        except Exception as e:
+            logger.error("[%s] Failed to download image (downloadCode=%s...): %s",
+                         self.name, download_code[:20], e)
+            return None
 
     # -- Inbound message processing -----------------------------------------
 
@@ -179,9 +260,28 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
             return
 
+        # Determine message type and extract content
+        raw_msg_type = getattr(message, "message_type", "text") or "text"
         text = self._extract_text(message)
-        if not text:
-            logger.debug("[%s] Empty message, skipping", self.name)
+        media_urls = []
+        media_types = []
+        msg_type = MessageType.TEXT
+
+        if raw_msg_type == "picture":
+            msg_type = MessageType.PHOTO
+            download_code = self._extract_download_code(message)
+            if download_code:
+                cached_path = await self._download_image(download_code)
+                if cached_path:
+                    media_urls = [cached_path]
+                    media_types = ["image/jpeg"]
+                else:
+                    logger.warning("[%s] Image download failed, proceeding without media", self.name)
+            else:
+                logger.warning("[%s] picture message missing downloadCode", self.name)
+            # Images without any text are still valid events
+        elif not text:
+            logger.debug("[%s] Empty message (type=%s), skipping", self.name, raw_msg_type)
             return
 
         # Chat context
@@ -218,34 +318,59 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=msg_type,
             source=source,
             message_id=msg_id,
             raw_message=message,
             timestamp=timestamp,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
-        logger.debug("[%s] Message from %s in %s: %s",
-                      self.name, sender_nick, chat_id[:20] if chat_id else "?", text[:50])
+        logger.debug("[%s] Message from %s in %s: type=%s text=%s media=%d",
+                      self.name, sender_nick, chat_id[:20] if chat_id else "?",
+                      raw_msg_type, text[:50] if text else "(none)", len(media_urls))
         await self.handle_message(event)
 
     @staticmethod
     def _extract_text(message: "ChatbotMessage") -> str:
         """Extract plain text from a DingTalk chatbot message."""
-        text = getattr(message, "text", None) or ""
-        if isinstance(text, dict):
-            content = text.get("content", "").strip()
-        else:
-            content = str(text).strip()
+        # SDK 0.24+: message.text is a TextContent object
+        text_obj = getattr(message, "text", None)
+        if text_obj is not None:
+            content = getattr(text_obj, "content", None) or ""
+            if isinstance(content, str):
+                content = content.strip()
+            else:
+                content = str(content).strip() if content else ""
+            if content:
+                return content
 
-        # Fall back to rich text if present
-        if not content:
-            rich_text = getattr(message, "rich_text", None)
-            if rich_text and isinstance(rich_text, list):
-                parts = [item["text"] for item in rich_text
-                         if isinstance(item, dict) and item.get("text")]
-                content = " ".join(parts).strip()
-        return content
+        # richText fallback: message.rich_text_content.rich_text_list
+        rich_text_obj = getattr(message, "rich_text_content", None)
+        if rich_text_obj is not None:
+            items = getattr(rich_text_obj, "rich_text_list", None) or []
+            parts = [item["text"] for item in items
+                     if isinstance(item, dict) and item.get("text")]
+            content = " ".join(parts).strip()
+            if content:
+                return content
+
+        return ""
+
+    @staticmethod
+    def _extract_download_code(message: "ChatbotMessage") -> Optional[str]:
+        """Extract the downloadCode from a DingTalk picture message.
+
+        SDK 0.24+: message.image_content is an ImageContent object
+        with a .download_code attribute.
+        """
+        image_content = getattr(message, "image_content", None)
+        if image_content is not None:
+            code = getattr(image_content, "download_code", None)
+            if code:
+                return str(code)
+        return None
 
     # -- Deduplication ------------------------------------------------------
 
@@ -306,6 +431,22 @@ class DingTalkAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about a DingTalk conversation."""
         return {"name": chat_id, "type": "group" if "group" in chat_id.lower() else "dm"}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _content_type_to_ext(content_type: str) -> str:
+    """Map a Content-Type header value to a file extension."""
+    ct = content_type.lower().split(";")[0].strip()
+    return {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+    }.get(ct, ".jpg")
 
 
 # ---------------------------------------------------------------------------
