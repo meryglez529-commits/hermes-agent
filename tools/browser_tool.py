@@ -94,11 +94,21 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
-# Includes macOS Homebrew paths (/opt/homebrew/* for Apple Silicon).
-_SANE_PATH = (
-    "/opt/homebrew/bin:/opt/homebrew/sbin:"
-    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Includes Android/Termux and macOS Homebrew locations needed for agent-browser,
+# npx, node, and Android's glibc runner (grun).
+_SANE_PATH_DIRS = (
+    "/data/data/com.termux/files/usr/bin",
+    "/data/data/com.termux/files/usr/sbin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
 )
+_SANE_PATH = os.pathsep.join(_SANE_PATH_DIRS)
 
 
 @functools.lru_cache(maxsize=1)
@@ -122,6 +132,28 @@ def _discover_homebrew_node_dirs() -> tuple[str, ...]:
     except OSError:
         pass
     return tuple(dirs)
+
+
+def _browser_candidate_path_dirs() -> list[str]:
+    """Return ordered browser CLI PATH candidates shared by discovery and execution."""
+    hermes_home = get_hermes_home()
+    hermes_node_bin = str(hermes_home / "node" / "bin")
+    return [hermes_node_bin, *list(_discover_homebrew_node_dirs()), *_SANE_PATH_DIRS]
+
+
+def _merge_browser_path(existing_path: str = "") -> str:
+    """Prepend browser-specific PATH fallbacks without reordering existing entries."""
+    path_parts = [p for p in (existing_path or "").split(os.pathsep) if p]
+    existing_parts = set(path_parts)
+    prefix_parts: list[str] = []
+
+    for part in _browser_candidate_path_dirs():
+        if not part or part in existing_parts or part in prefix_parts:
+            continue
+        if os.path.isdir(part):
+            prefix_parts.append(part)
+
+    return os.pathsep.join(prefix_parts + path_parts)
 
 # Throttle screenshot cleanup to avoid repeated full directory scans.
 _last_screenshot_cleanup_by_dir: dict[str, float] = {}
@@ -473,13 +505,104 @@ def _cleanup_inactive_browser_sessions():
             logger.warning("Error cleaning up inactive session %s: %s", task_id, e)
 
 
+def _reap_orphaned_browser_sessions():
+    """Scan for orphaned agent-browser daemon processes from previous runs.
+
+    When the Python process that created a browser session exits uncleanly
+    (SIGKILL, crash, gateway restart), the in-memory ``_active_sessions``
+    tracking is lost but the node + Chromium processes keep running.
+
+    This function scans the tmp directory for ``agent-browser-*`` socket dirs
+    left behind by previous runs, reads the daemon PID files, and kills any
+    daemons that are still alive but not tracked by the current process.
+
+    Called once on cleanup-thread startup — not every 30 seconds — to avoid
+    races with sessions being actively created.
+    """
+    import glob
+
+    tmpdir = _socket_safe_tmpdir()
+    pattern = os.path.join(tmpdir, "agent-browser-h_*")
+    socket_dirs = glob.glob(pattern)
+    # Also pick up CDP sessions
+    socket_dirs += glob.glob(os.path.join(tmpdir, "agent-browser-cdp_*"))
+
+    if not socket_dirs:
+        return
+
+    # Build set of session_names currently tracked by this process
+    with _cleanup_lock:
+        tracked_names = {
+            info.get("session_name")
+            for info in _active_sessions.values()
+            if info.get("session_name")
+        }
+
+    reaped = 0
+    for socket_dir in socket_dirs:
+        dir_name = os.path.basename(socket_dir)
+        # dir_name is "agent-browser-{session_name}"
+        session_name = dir_name.removeprefix("agent-browser-")
+        if not session_name:
+            continue
+
+        # Skip sessions that we are actively tracking
+        if session_name in tracked_names:
+            continue
+
+        pid_file = os.path.join(socket_dir, f"{session_name}.pid")
+        if not os.path.isfile(pid_file):
+            # No PID file — just a stale dir, remove it
+            shutil.rmtree(socket_dir, ignore_errors=True)
+            continue
+
+        try:
+            daemon_pid = int(Path(pid_file).read_text().strip())
+        except (ValueError, OSError):
+            shutil.rmtree(socket_dir, ignore_errors=True)
+            continue
+
+        # Check if the daemon is still alive
+        try:
+            os.kill(daemon_pid, 0)  # signal 0 = existence check
+        except ProcessLookupError:
+            # Already dead, just clean up the dir
+            shutil.rmtree(socket_dir, ignore_errors=True)
+            continue
+        except PermissionError:
+            # Alive but owned by someone else — leave it alone
+            continue
+
+        # Daemon is alive and not tracked — orphan. Kill it.
+        try:
+            os.kill(daemon_pid, signal.SIGTERM)
+            logger.info("Reaped orphaned browser daemon PID %d (session %s)",
+                        daemon_pid, session_name)
+            reaped += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+        # Clean up the socket directory
+        shutil.rmtree(socket_dir, ignore_errors=True)
+
+    if reaped:
+        logger.info("Reaped %d orphaned browser session(s) from previous run(s)", reaped)
+
+
 def _browser_cleanup_thread_worker():
     """
     Background thread that periodically cleans up inactive browser sessions.
     
     Runs every 30 seconds and checks for sessions that haven't been used
     within the BROWSER_SESSION_INACTIVITY_TIMEOUT period.
+    On first run, also reaps orphaned sessions from previous process lifetimes.
     """
+    # One-time orphan reap on startup
+    try:
+        _reap_orphaned_browser_sessions()
+    except Exception as e:
+        logger.warning("Orphan reap error: %s", e)
+
     while _cleanup_running:
         try:
             _cleanup_inactive_browser_sessions()
@@ -804,21 +927,10 @@ def _find_agent_browser() -> str:
         _agent_browser_resolved = True
         return which_result
 
-    # Build an extended search PATH including Homebrew and Hermes-managed dirs.
-    # This covers macOS where the process PATH may not include Homebrew paths.
-    extra_dirs: list[str] = []
-    for d in ["/opt/homebrew/bin", "/usr/local/bin"]:
-        if os.path.isdir(d):
-            extra_dirs.append(d)
-    extra_dirs.extend(_discover_homebrew_node_dirs())
-
-    hermes_home = get_hermes_home()
-    hermes_node_bin = str(hermes_home / "node" / "bin")
-    if os.path.isdir(hermes_node_bin):
-        extra_dirs.append(hermes_node_bin)
-
-    if extra_dirs:
-        extended_path = os.pathsep.join(extra_dirs)
+    # Build an extended search PATH including Hermes-managed Node, macOS
+    # versioned Homebrew installs, and fallback system dirs like Termux.
+    extended_path = _merge_browser_path("")
+    if extended_path:
         which_result = shutil.which("agent-browser", path=extended_path)
         if which_result:
             _cached_agent_browser = which_result
@@ -833,10 +945,10 @@ def _find_agent_browser() -> str:
         _agent_browser_resolved = True
         return _cached_agent_browser
     
-    # Check common npx locations (also search extended dirs)
+    # Check common npx locations (also search the extended fallback PATH)
     npx_path = shutil.which("npx")
-    if not npx_path and extra_dirs:
-        npx_path = shutil.which("npx", path=os.pathsep.join(extra_dirs))
+    if not npx_path and extended_path:
+        npx_path = shutil.which("npx", path=extended_path)
     if npx_path:
         _cached_agent_browser = "npx agent-browser"
         _agent_browser_resolved = True
@@ -955,24 +1067,9 @@ def _run_browser_command(
         
         browser_env = {**os.environ}
 
-        # Ensure PATH includes Hermes-managed Node first, Homebrew versioned
-        # node dirs (for macOS ``brew install node@24``), then standard system dirs.
-        hermes_home = get_hermes_home()
-        hermes_node_bin = str(hermes_home / "node" / "bin")
-
-        existing_path = browser_env.get("PATH", "")
-        path_parts = [p for p in existing_path.split(":") if p]
-        candidate_dirs = (
-            [hermes_node_bin]
-            + list(_discover_homebrew_node_dirs())
-            + [p for p in _SANE_PATH.split(":") if p]
-        )
-
-        for part in reversed(candidate_dirs):
-            if os.path.isdir(part) and part not in path_parts:
-                path_parts.insert(0, part)
-
-        browser_env["PATH"] = ":".join(path_parts)
+        # Ensure subprocesses inherit the same browser-specific PATH fallbacks
+        # used during CLI discovery.
+        browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
         
         # Use temp files for stdout/stderr instead of pipes.
@@ -1657,7 +1754,7 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     try:
         tab_info = _ensure_tab(task_id or "default")
         tab_id = tab_info.get("tab_id") or tab_info.get("id")
-        resp = _post(f"/tabs/{tab_id}/eval", body={"expression": expression})
+        resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": tab_info["user_id"]})
 
         # Camofox returns the result in a JSON envelope
         raw_result = resp.get("result") if isinstance(resp, dict) else resp
@@ -1873,10 +1970,10 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 ),
             }, ensure_ascii=False)
         
-        # Read and convert to base64
-        image_data = screenshot_path.read_bytes()
-        image_base64 = base64.b64encode(image_data).decode("ascii")
-        data_url = f"data:image/png;base64,{image_base64}"
+        # Convert screenshot to base64 at full resolution.
+        _screenshot_bytes = screenshot_path.read_bytes()
+        _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
+        data_url = f"data:image/png;base64,{_screenshot_b64}"
         
         vision_prompt = (
             f"You are analyzing a screenshot of a web browser.\n\n"
@@ -1890,7 +1987,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # Use the centralized LLM router
         vision_model = _get_vision_model()
         logger.debug("browser_vision: analysing screenshot (%d bytes)",
-                     len(image_data))
+                     len(_screenshot_bytes))
 
         # Read vision timeout from config (auxiliary.vision.timeout), default 120s.
         # Local vision models (llama.cpp, ollama) can take well over 30s for
@@ -1922,7 +2019,27 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         }
         if vision_model:
             call_kwargs["model"] = vision_model
-        response = call_llm(**call_kwargs)
+        # Try full-size screenshot; on size-related rejection, downscale and retry.
+        try:
+            response = call_llm(**call_kwargs)
+        except Exception as _api_err:
+            from tools.vision_tools import (
+                _is_image_size_error, _resize_image_for_vision, _RESIZE_TARGET_BYTES,
+            )
+            if (_is_image_size_error(_api_err)
+                    and len(data_url) > _RESIZE_TARGET_BYTES):
+                logger.info(
+                    "Vision API rejected screenshot (%.1f MB); "
+                    "auto-resizing to ~%.0f MB and retrying...",
+                    len(data_url) / (1024 * 1024),
+                    _RESIZE_TARGET_BYTES / (1024 * 1024),
+                )
+                data_url = _resize_image_for_vision(
+                    screenshot_path, mime_type="image/png")
+                call_kwargs["messages"][0]["content"][1]["image_url"]["url"] = data_url
+                response = call_llm(**call_kwargs)
+            else:
+                raise
         
         analysis = (response.choices[0].message.content or "").strip()
         # Redact secrets the vision LLM may have read from the screenshot.

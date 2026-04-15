@@ -23,7 +23,6 @@ import logging
 import mimetypes
 import os
 import re
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -46,6 +45,7 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -58,8 +58,6 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 20000
-DEDUP_WINDOW_SECONDS = 300
-DEDUP_MAX_SIZE = 1000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(api|oapi)\.dingtalk\.com/')
@@ -234,8 +232,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._stream_task: Optional[asyncio.Task] = None
         self._http_client: Optional["httpx.AsyncClient"] = None
 
-        # Message deduplication: msg_id -> timestamp
-        self._seen_messages: Dict[str, float] = {}
+        # Message deduplication
+        self._dedup = MessageDeduplicator(max_size=1000)
         # Map chat_id -> session_webhook for reply routing
         self._session_webhooks: Dict[str, str] = {}
 
@@ -325,6 +323,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._seen_messages.clear()
         self._access_token = None
         self._token_expires_at = 0.0
+        self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
 
     # -- Access token management --------------------------------------------
@@ -514,6 +513,16 @@ class DingTalkAdapter(BasePlatformAdapter):
         return cached_path
 
     # -- Inbound message processing -----------------------------------------
+
+    async def _on_message(self, message: "ChatbotMessage") -> None:
+        """Process an incoming DingTalk chatbot message."""
+        msg_id = getattr(message, "message_id", None) or uuid.uuid4().hex
+        if self._dedup.is_duplicate(msg_id):
+            logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
+            return
+            
+        envelope = self._build_inbound_envelope({}, sdk_message=message)
+        await self._process_envelope(envelope)
 
     def _build_inbound_envelope(
         self,
@@ -1006,20 +1015,6 @@ class DingTalkAdapter(BasePlatformAdapter):
                         out.append(str(c))
             return out
         return out
-
-    # -- Deduplication ------------------------------------------------------
-
-    def _is_duplicate(self, msg_id: str) -> bool:
-        """Check and record a message ID. Returns True if already seen."""
-        now = time.time()
-        if len(self._seen_messages) > DEDUP_MAX_SIZE:
-            cutoff = now - DEDUP_WINDOW_SECONDS
-            self._seen_messages = {k: v for k, v in self._seen_messages.items() if v > cutoff}
-
-        if msg_id in self._seen_messages:
-            return True
-        self._seen_messages[msg_id] = now
-        return False
 
     # -- Outbound messaging -------------------------------------------------
 

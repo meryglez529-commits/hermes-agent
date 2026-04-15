@@ -65,7 +65,10 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_audio_from_bytes,
     cache_document_from_bytes,
+    resolve_proxy_url,
     SUPPORTED_DOCUMENT_TYPES,
+    utf16_len,
+    _prefix_within_utf16_limit,
 )
 from gateway.platforms.telegram_network import (
     TelegramFallbackTransport,
@@ -147,7 +150,6 @@ class TelegramAdapter(BasePlatformAdapter):
         self._text_batch_split_delay_seconds = float(os.getenv("HERMES_TELEGRAM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
-        self._token_lock_identity: Optional[str] = None
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
@@ -300,9 +302,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Exhausted retries — fatal
         message = (
-            "Another Telegram bot poller is already using this token. "
+            "Another process is already polling this Telegram bot token "
+            "(possibly OpenClaw or another Hermes instance). "
             "Hermes stopped Telegram polling after %d retries. "
-            "Make sure only one gateway instance is running for this bot token."
+            "Only one poller can run per token — stop the other process "
+            "and restart with 'hermes start'."
             % MAX_CONFLICT_RETRIES
         )
         logger.error("[%s] %s Original error: %s", self.name, message, error)
@@ -497,23 +501,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         
         try:
-            from gateway.status import acquire_scoped_lock
-
-            self._token_lock_identity = self.config.token
-            acquired, existing = acquire_scoped_lock(
-                "telegram-bot-token",
-                self._token_lock_identity,
-                metadata={"platform": self.platform.value},
-            )
-            if not acquired:
-                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
-                message = (
-                    "Another local Hermes gateway is already using this Telegram bot token"
-                    + (f" (PID {owner_pid})." if owner_pid else ".")
-                    + " Stop the other gateway before starting a second Telegram poller."
-                )
-                logger.error("[%s] %s", self.name, message)
-                self._set_fatal_error("telegram_token_lock", message, retryable=False)
+            if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
             # Build the application
@@ -552,10 +540,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
             }
 
-            proxy_configured = any(
-                (os.getenv(k) or "").strip()
-                for k in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")
-            )
+            proxy_url = resolve_proxy_url()
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in ("1", "true", "yes", "on"))
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
@@ -566,7 +551,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     ", ".join(fallback_ips),
                 )
 
-            if fallback_ips and not proxy_configured and not disable_fallback:
+            if fallback_ips and not proxy_url and not disable_fallback:
                 logger.info(
                     "[%s] Telegram fallback IPs active: %s",
                     self.name,
@@ -582,10 +567,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     **request_kwargs,
                     httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
                 )
+            elif proxy_url:
+                logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
+                request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
+                get_updates_request = HTTPXRequest(**request_kwargs, proxy=proxy_url)
             else:
-                if proxy_configured:
-                    logger.info("[%s] Proxy configured; skipping Telegram fallback-IP transport", self.name)
-                elif disable_fallback:
+                if disable_fallback:
                     logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
                 request = HTTPXRequest(**request_kwargs)
                 get_updates_request = HTTPXRequest(**request_kwargs)
@@ -737,12 +724,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
             
         except Exception as e:
-            if self._token_lock_identity:
-                try:
-                    from gateway.status import release_scoped_lock
-                    release_scoped_lock("telegram-bot-token", self._token_lock_identity)
-                except Exception:
-                    pass
+            self._release_platform_lock()
             message = f"Telegram startup failed: {e}"
             self._set_fatal_error("telegram_connect_error", message, retryable=True)
             logger.error("[%s] Failed to connect to Telegram: %s", self.name, e, exc_info=True)
@@ -768,12 +750,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._app.shutdown()
             except Exception as e:
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, e, exc_info=True)
-        if self._token_lock_identity:
-            try:
-                from gateway.status import release_scoped_lock
-                release_scoped_lock("telegram-bot-token", self._token_lock_identity)
-            except Exception as e:
-                logger.warning("[%s] Error releasing Telegram token lock: %s", self.name, e, exc_info=True)
+        self._release_platform_lock()
 
         for task in self._pending_photo_batch_tasks.values():
             if task and not task.done():
@@ -784,7 +761,6 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         self._app = None
         self._bot = None
-        self._token_lock_identity = None
         logger.info("[%s] Disconnected from Telegram", self.name)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
@@ -825,7 +801,9 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Format and split message if needed
             formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            chunks = self.truncate_message(
+                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            )
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
@@ -996,7 +974,9 @@ class TelegramAdapter(BasePlatformAdapter):
             # streaming).  Truncate and succeed so the stream consumer can
             # split the overflow into a new message instead of dying.
             if "message_too_long" in err_str or "too long" in err_str:
-                truncated = content[: self.MAX_MESSAGE_LENGTH - 20] + "…"
+                truncated = _prefix_within_utf16_limit(
+                    content, self.MAX_MESSAGE_LENGTH - 20
+                ) + "…"
                 try:
                     await self._bot.edit_message_text(
                         chat_id=int(chat_id),
@@ -1936,9 +1916,20 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
         # 9) Convert blockquotes: > at line start → protect > from escaping
+        #    Handle both regular blockquotes (> text) and expandable blockquotes
+        #    (Telegram MarkdownV2: **> for expandable start, || to end the quote)
+        def _convert_blockquote(m):
+            prefix = m.group(1)  # >, >>, >>>, **>, or **>> etc.
+            content = m.group(2)
+            # Check if content ends with || (expandable blockquote end marker)
+            # In this case, preserve the trailing || unescaped for Telegram
+            if prefix.startswith('**') and content.endswith('||'):
+                return _ph(f'{prefix} {_escape_mdv2(content[:-2])}||')
+            return _ph(f'{prefix} {_escape_mdv2(content)}')
+
         text = re.sub(
-            r'^(>{1,3}) (.+)$',
-            lambda m: _ph(m.group(1) + ' ' + _escape_mdv2(m.group(2))),
+            r'^((?:\*\*)?>{1,3}) (.+)$',
+            _convert_blockquote,
             text,
             flags=re.MULTILINE,
         )
@@ -2010,6 +2001,27 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_ignored_threads(self) -> set[int]:
+        raw = self.config.extra.get("ignored_threads")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_IGNORED_THREADS", "")
+
+        if isinstance(raw, list):
+            values = raw
+        else:
+            values = str(raw).split(",")
+
+        ignored: set[int] = set()
+        for value in values:
+            text = str(value).strip()
+            if not text:
+                continue
+            try:
+                ignored.add(int(text))
+            except (TypeError, ValueError):
+                logger.warning("[%s] Ignoring invalid Telegram thread id: %r", self.name, value)
+        return ignored
 
     def _compile_mention_patterns(self) -> List[re.Pattern]:
         """Compile optional regex wake-word patterns for group triggers."""
@@ -2122,6 +2134,13 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._is_group_chat(message):
             return True
+        thread_id = getattr(message, "message_thread_id", None)
+        if thread_id is not None:
+            try:
+                if int(thread_id) in self._telegram_ignored_threads():
+                    return False
+            except (TypeError, ValueError):
+                logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
         if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
             return True
         if not self._telegram_require_mention():

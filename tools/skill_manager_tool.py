@@ -64,11 +64,11 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
             report = format_scan_report(result)
             return f"Security scan blocked this skill ({reason}):\n{report}"
         if allowed is None:
-            # "ask" — allow but include the warning so the user sees the findings
+            # "ask" verdict — for agent-created skills this means dangerous
+            # findings were detected.  Block the skill and include the report.
             report = format_scan_report(result)
-            logger.warning("Agent-created skill has security findings: %s", reason)
-            # Don't block — return None to allow, but log the warning
-            return None
+            logger.warning("Agent-created skill blocked (dangerous findings): %s", reason)
+            return f"Security scan blocked this skill ({reason}):\n{report}"
     except Exception as e:
         logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
     return None
@@ -219,13 +219,15 @@ def _validate_file_path(file_path: str) -> Optional[str]:
     Validate a file path for write_file/remove_file.
     Must be under an allowed subdirectory and not escape the skill dir.
     """
+    from tools.path_security import has_traversal_component
+
     if not file_path:
         return "file_path is required."
 
     normalized = Path(file_path)
 
     # Prevent path traversal
-    if ".." in normalized.parts:
+    if has_traversal_component(file_path):
         return "Path traversal ('..') is not allowed."
 
     # Must be under an allowed subdirectory
@@ -242,15 +244,12 @@ def _validate_file_path(file_path: str) -> Optional[str]:
 
 def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Path], Optional[str]]:
     """Resolve a supporting-file path and ensure it stays within the skill directory."""
+    from tools.path_security import validate_within_dir
+
     target = skill_dir / file_path
-    try:
-        resolved = target.resolve(strict=False)
-        skill_dir_resolved = skill_dir.resolve()
-        resolved.relative_to(skill_dir_resolved)
-    except ValueError:
-        return None, "Path escapes skill directory boundary."
-    except OSError as e:
-        return None, f"Invalid file path '{file_path}': {e}"
+    error = validate_within_dir(target, skill_dir)
+    if error:
+        return None, error
     return target, None
 
 

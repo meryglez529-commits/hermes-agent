@@ -220,6 +220,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
+    app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -275,6 +276,58 @@ class TestHealthEndpoint:
             data = await resp.json()
             assert data["status"] == "ok"
             assert data["platform"] == "hermes-agent"
+
+
+# ---------------------------------------------------------------------------
+# /health/detailed endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestHealthDetailedEndpoint:
+    @pytest.mark.asyncio
+    async def test_health_detailed_returns_ok(self, adapter):
+        """GET /health/detailed returns status, platform, and runtime fields."""
+        app = _create_app(adapter)
+        with patch("gateway.status.read_runtime_status", return_value={
+            "gateway_state": "running",
+            "platforms": {"telegram": {"state": "connected"}},
+            "active_agents": 2,
+            "exit_reason": None,
+            "updated_at": "2026-04-14T00:00:00Z",
+        }):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "ok"
+                assert data["platform"] == "hermes-agent"
+                assert data["gateway_state"] == "running"
+                assert data["platforms"] == {"telegram": {"state": "connected"}}
+                assert data["active_agents"] == 2
+                assert isinstance(data["pid"], int)
+                assert "updated_at" in data
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_no_runtime_status(self, adapter):
+        """When gateway_state.json is missing, fields are None."""
+        app = _create_app(adapter)
+        with patch("gateway.status.read_runtime_status", return_value=None):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "ok"
+                assert data["gateway_state"] is None
+                assert data["platforms"] == {}
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_does_not_require_auth(self, auth_adapter):
+        """Health detailed endpoint should be accessible without auth, like /health."""
+        app = _create_app(auth_adapter)
+        with patch("gateway.status.read_runtime_status", return_value=None):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
 
 
 # ---------------------------------------------------------------------------
@@ -409,10 +462,49 @@ class TestChatCompletionsEndpoint:
                 )
                 assert resp.status == 200
                 assert "text/event-stream" in resp.headers.get("Content-Type", "")
+                assert resp.headers.get("X-Accel-Buffering") == "no"
                 body = await resp.text()
                 assert "data: " in body
                 assert "[DONE]" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
+        """Idle SSE streams should send keepalive comments while tools run silently."""
+        import asyncio
+        import gateway.platforms.api_server as api_server_mod
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Working")
+                    await asyncio.sleep(0.65)
+                    cb("...done")
+                return (
+                    {"final_response": "Working...done", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with (
+                patch.object(api_server_mod, "CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS", 0.01),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "do the thing"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert ": keepalive" in body
+                assert "Working" in body
+                assert "...done" in body
+                assert "[DONE]" in body
 
     @pytest.mark.asyncio
     async def test_stream_survives_tool_call_none_sentinel(self, adapter):
