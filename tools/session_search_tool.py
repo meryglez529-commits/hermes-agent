@@ -23,7 +23,10 @@ from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
-MAX_SUMMARY_TOKENS = 10000
+# Cap output budget for session summaries. Gemini (via many gateways) rejects
+# maxOutputTokens above ~8192; keep this conservative so auxiliary model swaps
+# rarely need a code change.
+MAX_SUMMARY_TOKENS = 8192
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:

@@ -10,6 +10,7 @@ from tools.session_search_tool import (
     _truncate_around_matches,
     _HIDDEN_SESSION_SOURCES,
     MAX_SESSION_CHARS,
+    MAX_SUMMARY_TOKENS,
     SESSION_SEARCH_SCHEMA,
 )
 
@@ -17,6 +18,13 @@ from tools.session_search_tool import (
 # =========================================================================
 # Tool schema guidance
 # =========================================================================
+
+class TestSessionSummaryOutputBudget:
+    """Many Gemini-serving gateways reject max_output_tokens >= 8193 (see INVALID_ARGUMENT)."""
+
+    def test_max_summary_tokens_within_provider_cap(self):
+        assert MAX_SUMMARY_TOKENS <= 8192
+
 
 class TestHiddenSessionSources:
     """Verify the _HIDDEN_SESSION_SOURCES constant used for third-party isolation."""

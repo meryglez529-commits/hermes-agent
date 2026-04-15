@@ -220,6 +220,99 @@ class TestSend:
         assert result.success is False
         assert "400" in result.error
 
+    @pytest.mark.asyncio
+    async def test_send_image_file_uploads_media_and_posts_image_message(self, tmp_path):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True, extra={"client_id": "robot-code"}))
+        image_path = tmp_path / "photo.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+        adapter._upload_media_file = AsyncMock(return_value="@media-image-1")
+        adapter._send_payload = AsyncMock(return_value=MagicMock(success=True, message_id="img-1"))
+
+        result = await adapter.send_image_file(
+            "chat-123",
+            str(image_path),
+            caption="see this",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is True
+        adapter._upload_media_file.assert_awaited_once_with(str(image_path), media_type="image")
+        adapter._send_payload.assert_awaited_once_with(
+            "chat-123",
+            {
+                "msgtype": "image",
+                "image": {"media_id": "@media-image-1"},
+            },
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_document_uploads_media_and_posts_file_message(self, tmp_path):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True, extra={"client_id": "robot-code"}))
+        file_path = tmp_path / "report.pdf"
+        file_path.write_bytes(b"%PDF-1.4\n%fake\n")
+
+        adapter._upload_media_file = AsyncMock(return_value="@media-file-1")
+        adapter._send_payload = AsyncMock(return_value=MagicMock(success=True, message_id="file-1"))
+
+        result = await adapter.send_document(
+            "chat-456",
+            str(file_path),
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is True
+        adapter._upload_media_file.assert_awaited_once_with(str(file_path), media_type="file")
+        adapter._send_payload.assert_awaited_once_with(
+            "chat-456",
+            {
+                "msgtype": "file",
+                "file": {"media_id": "@media-file-1"},
+            },
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_falls_back_to_markdown_when_native_send_fails(self, tmp_path):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        image_path = tmp_path / "fallback.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+        adapter._upload_media_file = AsyncMock(side_effect=RuntimeError("upload failed"))
+        adapter.send = AsyncMock(return_value=MagicMock(success=True, message_id="fallback-1"))
+
+        result = await adapter.send_image_file(
+            "chat-789",
+            str(image_path),
+            caption="fallback caption",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is True
+        adapter.send.assert_awaited_once()
+        assert "fallback.png" in adapter.send.await_args.kwargs["content"]
+
+    @pytest.mark.asyncio
+    async def test_send_document_returns_error_for_missing_file(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        result = await adapter.send_document(
+            "chat-404",
+            "/tmp/does-not-exist.pdf",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is False
+        assert "not found" in result.error.lower()
+
 
 # ---------------------------------------------------------------------------
 # Connect / disconnect
@@ -341,6 +434,66 @@ class TestAccessToken:
 
         token = await adapter._get_access_token()
         assert token is None
+
+
+# ---------------------------------------------------------------------------
+# Transport resilience
+# ---------------------------------------------------------------------------
+
+
+class TestTransportResilience:
+
+    @pytest.mark.asyncio
+    async def test_download_message_file_retries_after_timeout(self):
+        import httpx
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._get_access_token = AsyncMock(return_value="tok")
+
+        timeout = httpx.TimeoutException("timed out")
+        ok_resp = MagicMock()
+        ok_resp.content = b"%PDF-1.4\n"
+        ok_resp.headers = {"content-type": "application/pdf"}
+        ok_resp.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=[timeout, ok_resp])
+        adapter._http_client = mock_client
+
+        with patch("gateway.platforms.dingtalk.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            result = await adapter._download_message_file("dl-retry-1")
+
+        assert result == (b"%PDF-1.4\n", "application/pdf", None)
+        assert mock_client.post.await_count == 2
+        mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_upload_media_file_retries_after_timeout(self, tmp_path):
+        import httpx
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._get_access_token = AsyncMock(return_value="tok")
+
+        file_path = tmp_path / "retry.pdf"
+        file_path.write_bytes(b"%PDF-1.4\n")
+
+        timeout = httpx.TimeoutException("timed out")
+        ok_resp = MagicMock()
+        ok_resp.raise_for_status = MagicMock()
+        ok_resp.json.return_value = {"errcode": 0, "media_id": "@retry-media"}
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=[timeout, ok_resp])
+        adapter._http_client = mock_client
+
+        with patch("gateway.platforms.dingtalk.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            result = await adapter._upload_media_file(str(file_path), media_type="file")
+
+        assert result == "@retry-media"
+        assert mock_client.post.await_count == 2
+        mock_sleep.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +625,256 @@ class TestPictureMessageHandling:
         assert len(received_events) == 1
         assert received_events[0].message_type == MessageType.PHOTO
         assert received_events[0].media_urls == []
+
+
+# ---------------------------------------------------------------------------
+# File/document inbound handling
+# ---------------------------------------------------------------------------
+
+
+class TestFileMessageHandling:
+
+    def test_build_inbound_envelope_prefers_raw_payload_for_file_message(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        raw_payload = {
+            "msgtype": "file",
+            "msgId": "msg-file-raw-1",
+            "conversationId": "conv-file-raw-1",
+            "conversationType": "1",
+            "senderId": "user-file-raw-1",
+            "senderNick": "Carol",
+            "senderStaffId": "staff-file-raw-1",
+            "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?session=abc",
+            "createAt": 1776151837330,
+            "content": {
+                "fileName": "demo.pdf",
+                "downloadCode": "file-code-raw-1",
+            },
+        }
+        sdk_message = MagicMock()
+        sdk_message.message_type = "text"
+        sdk_message.text = None
+        sdk_message.rich_text_content = None
+
+        envelope = adapter._build_inbound_envelope(raw_payload, sdk_message=sdk_message)
+
+        assert envelope.raw_msg_type == "file"
+        assert envelope.message_id == "msg-file-raw-1"
+        assert envelope.conversation_id == "conv-file-raw-1"
+        assert envelope.sender_nick == "Carol"
+        assert envelope.file_refs == [{
+            "download_code": "file-code-raw-1",
+            "filename": "demo.pdf",
+            "raw_message_type": "file",
+        }]
+
+    @pytest.mark.asyncio
+    async def test_process_inbound_envelope_dispatches_document_even_if_sdk_type_wrong(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._download_attachment = AsyncMock(return_value={
+            "kind": "file",
+            "local_path": "/tmp/raw-first.pdf",
+            "filename": "raw-first.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 4321,
+            "raw_message_type": "file",
+        })
+
+        received_events = []
+
+        async def fake_handle(event):
+            received_events.append(event)
+
+        adapter.handle_message = fake_handle
+
+        raw_payload = {
+            "msgtype": "file",
+            "msgId": "msg-file-raw-2",
+            "conversationId": "conv-file-raw-2",
+            "conversationType": "1",
+            "senderId": "user-file-raw-2",
+            "senderNick": "Dora",
+            "senderStaffId": "staff-file-raw-2",
+            "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?session=xyz",
+            "createAt": 1776151837330,
+            "content": {
+                "fileName": "raw-first.pdf",
+                "downloadCode": "file-code-raw-2",
+            },
+        }
+        sdk_message = MagicMock()
+        sdk_message.message_type = "text"
+        sdk_message.text = None
+        sdk_message.rich_text_content = None
+        sdk_message.conversation_title = None
+
+        envelope = adapter._build_inbound_envelope(raw_payload, sdk_message=sdk_message)
+
+        await adapter._process_inbound_envelope(envelope)
+
+        assert len(received_events) == 1
+        event = received_events[0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.raw_message == raw_payload
+        assert event.media_urls == ["/tmp/raw-first.pdf"]
+        assert event.media_types == ["application/pdf"]
+        assert event.attachments == [{
+            "kind": "file",
+            "local_path": "/tmp/raw-first.pdf",
+            "filename": "raw-first.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 4321,
+            "raw_message_type": "file",
+        }]
+
+    @pytest.mark.asyncio
+    async def test_process_inbound_envelope_logs_normalization_and_dispatch(self, caplog):
+        import logging
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._download_attachment = AsyncMock(return_value={
+            "kind": "file",
+            "local_path": "/tmp/trace.pdf",
+            "filename": "trace.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 99,
+            "raw_message_type": "file",
+        })
+        adapter.handle_message = AsyncMock()
+
+        raw_payload = {
+            "msgtype": "file",
+            "msgId": "msg-file-log-1",
+            "conversationId": "conv-file-log-1",
+            "conversationType": "1",
+            "senderId": "user-file-log-1",
+            "senderNick": "Eve",
+            "senderStaffId": "staff-file-log-1",
+            "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?session=log",
+            "createAt": 1776151837330,
+            "content": {
+                "fileName": "trace.pdf",
+                "downloadCode": "file-code-log-1",
+            },
+        }
+        envelope = adapter._build_inbound_envelope(raw_payload, sdk_message=MagicMock())
+
+        with caplog.at_level(logging.INFO):
+            await adapter._process_inbound_envelope(envelope)
+
+        joined = "\n".join(record.getMessage() for record in caplog.records)
+        assert "Normalized inbound envelope" in joined
+        assert "Resolved inbound attachments" in joined
+        assert "Dispatching inbound event" in joined
+
+    @pytest.mark.asyncio
+    async def test_process_inbound_envelope_logs_attachment_failure_without_dropping_file_message(self, caplog):
+        import logging
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._download_attachment = AsyncMock(return_value=None)
+        received_events = []
+
+        async def fake_handle(event):
+            received_events.append(event)
+
+        adapter.handle_message = fake_handle
+
+        raw_payload = {
+            "msgtype": "file",
+            "msgId": "msg-file-fail-1",
+            "conversationId": "conv-file-fail-1",
+            "conversationType": "1",
+            "senderId": "user-file-fail-1",
+            "senderNick": "Finn",
+            "senderStaffId": "staff-file-fail-1",
+            "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?session=fail",
+            "createAt": 1776151837330,
+            "content": {
+                "fileName": "broken.pdf",
+                "downloadCode": "file-code-fail-1",
+            },
+        }
+        envelope = adapter._build_inbound_envelope(raw_payload, sdk_message=MagicMock())
+
+        with caplog.at_level(logging.INFO):
+            await adapter._process_inbound_envelope(envelope)
+
+        assert len(received_events) == 1
+        assert received_events[0].message_type == MessageType.DOCUMENT
+        assert received_events[0].attachments == []
+        joined = "\n".join(record.getMessage() for record in caplog.records)
+        assert "Attachment download failed" in joined
+
+    def test_collect_download_codes_extracts_file_download_code_from_raw_dict(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        msg = MagicMock()
+        msg.message_type = "file"
+        msg.raw_dict = {"content": {"downloadCode": "file-code-1"}}
+
+        assert DingTalkAdapter._collect_download_codes(msg) == ["file-code-1"]
+
+    @pytest.mark.asyncio
+    async def test_file_message_is_dispatched_as_document_with_attachment(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._download_attachment = AsyncMock(return_value={
+            "kind": "file",
+            "local_path": "/tmp/demo.pdf",
+            "filename": "demo.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 1234,
+            "raw_message_type": "file",
+        })
+
+        received_events = []
+
+        async def fake_handle(event):
+            received_events.append(event)
+
+        adapter.handle_message = fake_handle
+
+        msg = MagicMock()
+        msg.message_id = "file-001"
+        msg.message_type = "file"
+        msg.text = None
+        msg.rich_text_content = None
+        msg.raw_dict = {"content": {"downloadCode": "file-code-1", "fileName": "demo.pdf"}}
+        msg.conversation_id = "conv-file-1"
+        msg.conversation_type = "1"
+        msg.sender_id = "user-file-1"
+        msg.sender_nick = "Carol"
+        msg.sender_staff_id = ""
+        msg.session_webhook = "https://hook.example/file-1"
+        msg.conversation_title = None
+        msg.create_at = None
+
+        await adapter._on_message(msg)
+
+        assert len(received_events) == 1
+        event = received_events[0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls == ["/tmp/demo.pdf"]
+        assert event.media_types == ["application/pdf"]
+        assert event.attachments == [{
+            "kind": "file",
+            "local_path": "/tmp/demo.pdf",
+            "filename": "demo.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 1234,
+            "raw_message_type": "file",
+        }]
 
 
 # ---------------------------------------------------------------------------
