@@ -1630,6 +1630,20 @@ class BasePlatformAdapter(ABC):
             min_ms, max_ms = 800, 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    def _build_reply_metadata(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
+        """Build outbound reply metadata from inbound event routing fields."""
+        metadata: Dict[str, Any] = {}
+        if event.source.thread_id:
+            metadata["thread_id"] = event.source.thread_id
+
+        # Preserve platform-specific per-message routing keys when present.
+        if isinstance(event.raw_message, dict):
+            session_webhook = event.raw_message.get("session_webhook") or event.raw_message.get("sessionWebhook")
+            if isinstance(session_webhook, str) and session_webhook.strip():
+                metadata["session_webhook"] = session_webhook.strip()
+
+        return metadata or None
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -1651,7 +1665,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        _thread_metadata = self._build_reply_metadata(event)
         typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
         
         try:
@@ -1887,7 +1901,7 @@ class BasePlatformAdapter(ABC):
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                _thread_metadata = self._build_reply_metadata(event)
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(

@@ -23,6 +23,7 @@ import logging
 import mimetypes
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -320,7 +321,6 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         self._stream_client = None
         self._session_webhooks.clear()
-        self._seen_messages.clear()
         self._access_token = None
         self._token_expires_at = 0.0
         self._dedup.clear()
@@ -513,16 +513,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         return cached_path
 
     # -- Inbound message processing -----------------------------------------
-
-    async def _on_message(self, message: "ChatbotMessage") -> None:
-        """Process an incoming DingTalk chatbot message."""
-        msg_id = getattr(message, "message_id", None) or uuid.uuid4().hex
-        if self._dedup.is_duplicate(msg_id):
-            logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
-            return
-            
-        envelope = self._build_inbound_envelope({}, sdk_message=message)
-        await self._process_envelope(envelope)
 
     def _build_inbound_envelope(
         self,
@@ -888,7 +878,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     async def _process_inbound_envelope(self, envelope: DingTalkInboundEnvelope) -> None:
         """Process a normalized DingTalk envelope into a MessageEvent."""
-        if self._is_duplicate(envelope.message_id):
+        if self._dedup.is_duplicate(envelope.message_id):
             logger.debug("[%s] Duplicate message %s, skipping", self.name, envelope.message_id)
             return
 
@@ -1027,7 +1017,11 @@ class DingTalkAdapter(BasePlatformAdapter):
         """Send a prebuilt payload to the session webhook with retry handling."""
         metadata = metadata or {}
 
-        session_webhook = metadata.get("session_webhook") or self._session_webhooks.get(chat_id)
+        session_webhook = (
+            metadata.get("session_webhook")
+            or metadata.get("sessionWebhook")
+            or self._session_webhooks.get(chat_id)
+        )
         if not session_webhook:
             return SendResult(
                 success=False,
@@ -1046,6 +1040,16 @@ class DingTalkAdapter(BasePlatformAdapter):
             try:
                 resp = await self._http_client.post(session_webhook, json=payload, timeout=20.0)
                 if resp.status_code < 300:
+                    # DingTalk can return HTTP 200 with a non-zero business errcode.
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = None
+                    if isinstance(body, dict):
+                        errcode = body.get("errcode")
+                        if errcode not in (None, 0):
+                            errmsg = body.get("errmsg") or body.get("message") or "unknown error"
+                            return SendResult(success=False, error=f"DingTalk errcode {errcode}: {errmsg}")
                     return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
                 body = resp.text
                 logger.warning("[%s] Send failed HTTP %d: %s", self.name, resp.status_code, body[:200])
@@ -1117,6 +1121,62 @@ class DingTalkAdapter(BasePlatformAdapter):
         """Send a markdown reply via DingTalk session webhook."""
         return await self._send_markdown(chat_id, content, metadata=metadata)
 
+    def _log_media_delivery_outcome(
+        self,
+        *,
+        kind: str,
+        chat_id: str,
+        outcome: str,
+        message_id: Optional[str] = None,
+        native_error: Optional[str] = None,
+    ) -> None:
+        """Emit structured-ish logs for DingTalk media delivery outcomes."""
+        logger.info(
+            "[%s] media_delivery platform=dingtalk kind=%s outcome=%s chat_id=%s message_id=%s native_error=%s",
+            self.name,
+            kind,
+            outcome,
+            chat_id,
+            message_id or "-",
+            native_error or "-",
+        )
+
+    @staticmethod
+    def _should_try_next_payload_variant(error: Optional[str]) -> bool:
+        """Whether a send error suggests payload-schema mismatch."""
+        if not error:
+            return False
+        text = error.lower()
+        return (
+            "miss param" in text
+            or "invalidparameter" in text
+            or "消息内容不合法" in error
+        )
+
+    async def _send_payload_variants(
+        self,
+        chat_id: str,
+        payloads: List[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Try multiple payload shapes to match DingTalk message schema variants."""
+        last_result = SendResult(success=False, error="No payload variants provided")
+        for idx, payload in enumerate(payloads):
+            result = await self._send_payload(chat_id, payload, metadata=metadata)
+            if result.success:
+                return result
+            last_result = result
+            if idx < len(payloads) - 1 and self._should_try_next_payload_variant(result.error):
+                logger.warning(
+                    "[%s] Payload variant %d failed (%s), trying next variant",
+                    self.name,
+                    idx + 1,
+                    result.error,
+                )
+                continue
+            break
+        return last_result
+
     async def send_image_file(
         self,
         chat_id: str,
@@ -1125,28 +1185,15 @@ class DingTalkAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a local image file as a native DingTalk image message."""
-        try:
-            media_id = await self._upload_media_file(image_path, media_type="image")
-            return await self._send_payload(
-                chat_id,
-                {
-                    "msgtype": "image",
-                    "image": {"media_id": media_id},
-                },
-                metadata=metadata,
-            )
-        except FileNotFoundError as e:
-            return SendResult(success=False, error=str(e))
-        except Exception as e:
-            logger.warning("[%s] Native image send failed, falling back to markdown: %s", self.name, e)
-            fallback = f"{caption}\n🖼️ Image: {image_path}" if caption else f"🖼️ Image: {image_path}"
-            return await self.send(
-                chat_id=chat_id,
-                content=fallback,
-                reply_to=reply_to,
-                metadata=metadata,
-            )
+        """Send image inputs via DingTalk file channel for stable client rendering."""
+        return await self.send_document(
+            chat_id=chat_id,
+            file_path=image_path,
+            caption=caption,
+            file_name=Path(image_path).name,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
 
     async def send_document(
         self,
@@ -1164,32 +1211,94 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         try:
             media_id = await self._upload_media_file(str(path), media_type="file")
-            result = await self._send_payload(
-                chat_id,
+            file_type = path.suffix.lstrip(".").lower() or None
+            payloads = [
                 {
                     "msgtype": "file",
-                    "file": {"media_id": media_id},
+                    "file": {
+                        "mediaId": media_id,
+                        "fileName": path.name,
+                        **({"fileType": file_type} if file_type else {}),
+                    },
                 },
-                metadata=metadata,
-            )
+                {"msgtype": "file", "file": {"media_id": media_id}},
+                {"msgtype": "file", "file": {"mediaId": media_id}},
+            ]
+            result = await self._send_payload_variants(chat_id, payloads, metadata=metadata)
+            if not result.success:
+                self._log_media_delivery_outcome(
+                    kind="file",
+                    chat_id=chat_id,
+                    outcome="native_failed",
+                    message_id=result.message_id,
+                    native_error=result.error,
+                )
+                return result
             if caption:
-                await self.send(
+                caption_result = await self.send(
                     chat_id=chat_id,
                     content=caption,
                     reply_to=reply_to,
                     metadata=metadata,
                 )
+                if not caption_result.success:
+                    # File already sent, but caption follow-up failed.
+                    self._log_media_delivery_outcome(
+                        kind="file",
+                        chat_id=chat_id,
+                        outcome="partial_success_caption_failed",
+                        message_id=result.message_id,
+                        native_error=caption_result.error,
+                    )
+                    return SendResult(
+                        success=False,
+                        message_id=result.message_id,
+                        error=f"file sent but caption failed: {caption_result.error}",
+                        raw_response={
+                            "partial_success": True,
+                            "native_kind": "file",
+                            "file_message_id": result.message_id,
+                        },
+                    )
+            self._log_media_delivery_outcome(
+                kind="file",
+                chat_id=chat_id,
+                outcome="native_success",
+                message_id=result.message_id,
+            )
             return result
         except Exception as e:
             logger.warning("[%s] Native file send failed, falling back to markdown: %s", self.name, e)
             display_name = file_name or path.name
             fallback = f"{caption}\n📎 File: {display_name}" if caption else f"📎 File: {display_name}"
-            return await self.send(
+            fallback_result = await self.send(
                 chat_id=chat_id,
                 content=fallback,
                 reply_to=reply_to,
                 metadata=metadata,
             )
+            if fallback_result.success:
+                fallback_result.raw_response = {
+                    "degraded": True,
+                    "mode": "markdown_fallback",
+                    "native_kind": "file",
+                    "native_error": str(e),
+                }
+                self._log_media_delivery_outcome(
+                    kind="file",
+                    chat_id=chat_id,
+                    outcome="degraded_markdown_fallback",
+                    message_id=fallback_result.message_id,
+                    native_error=str(e),
+                )
+            else:
+                self._log_media_delivery_outcome(
+                    kind="file",
+                    chat_id=chat_id,
+                    outcome="fallback_failed",
+                    native_error=f"{e}; fallback_error={fallback_result.error}",
+                )
+            return fallback_result
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """DingTalk does not support typing indicators."""

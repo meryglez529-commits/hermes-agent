@@ -222,33 +222,72 @@ class TestSend:
         assert "400" in result.error
 
     @pytest.mark.asyncio
-    async def test_send_image_file_uploads_media_and_posts_image_message(self, tmp_path):
+    async def test_send_handles_business_errcode_in_200_response(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = '{"errcode":1234,"errmsg":"invalid"}'
+        mock_response.json.return_value = {"errcode": 1234, "errmsg": "invalid"}
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        adapter._http_client = mock_client
+
+        result = await adapter.send(
+            "chat-123", "Hello!",
+            metadata={"session_webhook": "https://example/webhook"}
+        )
+        assert result.success is False
+        assert "errcode" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_accepts_sessionWebhook_metadata_alias(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "OK"
+        mock_response.json = MagicMock(side_effect=ValueError("not json"))
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        adapter._http_client = mock_client
+
+        result = await adapter.send(
+            "chat-123", "Hello!",
+            metadata={"sessionWebhook": "https://example/webhook-alias"}
+        )
+        assert result.success is True
+        assert mock_client.post.call_args[0][0] == "https://example/webhook-alias"
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_uploads_media_and_posts_file_message(self, tmp_path):
         from gateway.platforms.dingtalk import DingTalkAdapter
 
         adapter = DingTalkAdapter(PlatformConfig(enabled=True, extra={"client_id": "robot-code"}))
         image_path = tmp_path / "photo.png"
         image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
 
-        adapter._upload_media_file = AsyncMock(return_value="@media-image-1")
+        adapter._upload_media_file = AsyncMock(return_value="@media-file-1")
         adapter._send_payload = AsyncMock(return_value=MagicMock(success=True, message_id="img-1"))
 
         result = await adapter.send_image_file(
             "chat-123",
             str(image_path),
-            caption="see this",
             metadata={"session_webhook": "https://dingtalk.example/webhook"},
         )
 
         assert result.success is True
-        adapter._upload_media_file.assert_awaited_once_with(str(image_path), media_type="image")
-        adapter._send_payload.assert_awaited_once_with(
-            "chat-123",
-            {
-                "msgtype": "image",
-                "image": {"media_id": "@media-image-1"},
-            },
-            metadata={"session_webhook": "https://dingtalk.example/webhook"},
-        )
+        adapter._upload_media_file.assert_awaited_once_with(str(image_path), media_type="file")
+        adapter._send_payload.assert_awaited_once()
+        call_args = adapter._send_payload.await_args
+        assert call_args.args[0] == "chat-123"
+        assert call_args.kwargs["metadata"] == {"session_webhook": "https://dingtalk.example/webhook"}
+        payload = call_args.args[1]
+        assert payload["msgtype"] == "file"
+        assert payload["file"]["mediaId"] == "@media-file-1"
+        assert payload["file"]["fileName"] == "photo.png"
 
     @pytest.mark.asyncio
     async def test_send_document_uploads_media_and_posts_file_message(self, tmp_path):
@@ -269,14 +308,14 @@ class TestSend:
 
         assert result.success is True
         adapter._upload_media_file.assert_awaited_once_with(str(file_path), media_type="file")
-        adapter._send_payload.assert_awaited_once_with(
-            "chat-456",
-            {
-                "msgtype": "file",
-                "file": {"media_id": "@media-file-1"},
-            },
-            metadata={"session_webhook": "https://dingtalk.example/webhook"},
-        )
+        adapter._send_payload.assert_awaited_once()
+        call_args = adapter._send_payload.await_args
+        assert call_args.args[0] == "chat-456"
+        assert call_args.kwargs["metadata"] == {"session_webhook": "https://dingtalk.example/webhook"}
+        payload = call_args.args[1]
+        assert payload["msgtype"] == "file"
+        assert payload["file"]["mediaId"] == "@media-file-1"
+        assert payload["file"]["fileName"] == "report.pdf"
 
     @pytest.mark.asyncio
     async def test_send_image_file_falls_back_to_markdown_when_native_send_fails(self, tmp_path):
@@ -299,6 +338,33 @@ class TestSend:
         assert result.success is True
         adapter.send.assert_awaited_once()
         assert "fallback.png" in adapter.send.await_args.kwargs["content"]
+        assert isinstance(result.raw_response, dict)
+        assert result.raw_response.get("degraded") is True
+        assert result.raw_response.get("native_kind") == "file"
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_posts_single_file_payload(self, tmp_path):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        image_path = tmp_path / "single-file.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+        adapter._upload_media_file = AsyncMock(return_value="@media-file-single")
+        adapter._send_payload = AsyncMock(return_value=MagicMock(success=True, message_id="img-single-1"))
+
+        result = await adapter.send_image_file(
+            "chat-single",
+            str(image_path),
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is True
+        adapter._send_payload.assert_awaited_once()
+        payload = adapter._send_payload.await_args.args[1]
+        assert payload["msgtype"] == "file"
+        assert payload["file"]["mediaId"] == "@media-file-single"
+        assert payload["file"]["fileName"] == "single-file.png"
 
     @pytest.mark.asyncio
     async def test_send_document_returns_error_for_missing_file(self):
@@ -313,6 +379,101 @@ class TestSend:
 
         assert result.success is False
         assert "not found" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_send_document_falls_back_to_markdown_marks_degraded(self, tmp_path):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        file_path = tmp_path / "fallback.pdf"
+        file_path.write_bytes(b"%PDF-1.4\n%fake\n")
+
+        adapter._upload_media_file = AsyncMock(side_effect=RuntimeError("upload failed"))
+        adapter.send = AsyncMock(return_value=MagicMock(success=True, message_id="fallback-doc-1", raw_response=None))
+
+        result = await adapter.send_document(
+            "chat-doc-fallback",
+            str(file_path),
+            caption="fallback doc",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is True
+        adapter.send.assert_awaited_once()
+        assert "fallback.pdf" in adapter.send.await_args.kwargs["content"]
+        assert isinstance(result.raw_response, dict)
+        assert result.raw_response.get("degraded") is True
+        assert result.raw_response.get("native_kind") == "file"
+
+    @pytest.mark.asyncio
+    async def test_send_document_returns_partial_failure_when_caption_send_fails(self, tmp_path):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        file_path = tmp_path / "report2.pdf"
+        file_path.write_bytes(b"%PDF-1.4\n%fake2\n")
+
+        adapter._upload_media_file = AsyncMock(return_value="@media-file-2")
+        adapter._send_payload = AsyncMock(return_value=MagicMock(success=True, message_id="file-2"))
+        adapter.send = AsyncMock(return_value=MagicMock(success=False, error="caption failed"))
+
+        result = await adapter.send_document(
+            "chat-456",
+            str(file_path),
+            caption="caption text",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is False
+        assert "caption failed" in (result.error or "")
+        assert isinstance(result.raw_response, dict)
+        assert result.raw_response.get("partial_success") is True
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_logs_degraded_outcome(self, tmp_path, caplog):
+        import logging
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        image_path = tmp_path / "fallback-log.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+        adapter._upload_media_file = AsyncMock(side_effect=RuntimeError("upload failed"))
+        adapter.send = AsyncMock(return_value=MagicMock(success=True, message_id="fallback-log-1", raw_response=None))
+
+        with caplog.at_level(logging.INFO):
+            await adapter.send_image_file(
+                "chat-log-image",
+                str(image_path),
+                metadata={"session_webhook": "https://dingtalk.example/webhook"},
+            )
+
+        joined = "\n".join(record.getMessage() for record in caplog.records)
+        assert "media_delivery platform=dingtalk kind=file outcome=degraded_markdown_fallback" in joined
+
+    @pytest.mark.asyncio
+    async def test_send_document_logs_partial_success_outcome(self, tmp_path, caplog):
+        import logging
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        file_path = tmp_path / "report-log.pdf"
+        file_path.write_bytes(b"%PDF-1.4\n%fake-log\n")
+
+        adapter._upload_media_file = AsyncMock(return_value="@media-file-log")
+        adapter._send_payload = AsyncMock(return_value=MagicMock(success=True, message_id="file-log-1"))
+        adapter.send = AsyncMock(return_value=MagicMock(success=False, error="caption failed"))
+
+        with caplog.at_level(logging.INFO):
+            await adapter.send_document(
+                "chat-log-file",
+                str(file_path),
+                caption="caption text",
+                metadata={"session_webhook": "https://dingtalk.example/webhook"},
+            )
+
+        joined = "\n".join(record.getMessage() for record in caplog.records)
+        assert "media_delivery platform=dingtalk kind=file outcome=partial_success_caption_failed" in joined
 
 
 # ---------------------------------------------------------------------------

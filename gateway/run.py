@@ -5502,7 +5502,13 @@ class GatewayRunner:
             _, cleaned = adapter.extract_images(response)
             local_files, _ = adapter.extract_local_files(cleaned)
 
-            _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+            _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else {}
+            if isinstance(event.raw_message, dict):
+                session_webhook = event.raw_message.get("session_webhook") or event.raw_message.get("sessionWebhook")
+                if isinstance(session_webhook, str) and session_webhook.strip():
+                    _thread_meta["session_webhook"] = session_webhook.strip()
+            if not _thread_meta:
+                _thread_meta = None
 
             _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
