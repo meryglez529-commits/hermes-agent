@@ -164,7 +164,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
 
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit",
-               cli_only=True, aliases=("exit", "q")),
+               cli_only=True, aliases=("exit",)),
 ]
 
 
@@ -844,8 +844,7 @@ class SlashCommandCompleter(Completer):
             return None
         return word
 
-    @staticmethod
-    def _context_completions(word: str, limit: int = 30):
+    def _context_completions(self, word: str, limit: int = 30):
         """Yield Claude Code-style @ context completions.
 
         Bare ``@`` or ``@partial`` shows static references and matching

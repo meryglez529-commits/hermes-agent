@@ -419,6 +419,27 @@ DEFAULT_CONFIG = {
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
 
     },
+
+    # AWS Bedrock provider configuration.
+    # Only used when model.provider is "bedrock".
+    "bedrock": {
+        "region": "",  # AWS region for Bedrock API calls (empty = AWS_REGION env var → us-east-1)
+        "discovery": {
+            "enabled": True,           # Auto-discover models via ListFoundationModels
+            "provider_filter": [],     # Only show models from these providers (e.g. ["anthropic", "amazon"])
+            "refresh_interval": 3600,  # Cache discovery results for this many seconds
+        },
+        "guardrail": {
+            # Amazon Bedrock Guardrails — content filtering and safety policies.
+            # Create a guardrail in the Bedrock console, then set the ID and version here.
+            # See: https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html
+            "guardrail_identifier": "",  # e.g. "abc123def456"
+            "guardrail_version": "",     # e.g. "1" or "DRAFT"
+            "stream_processing_mode": "async",  # "sync" or "async"
+            "trace": "disabled",         # "enabled", "disabled", or "enabled_full"
+        },
+    },
+
     "smart_model_routing": {
         "enabled": False,
         "max_simple_chars": 160,
@@ -638,6 +659,7 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
+        "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
     },
 
     # WhatsApp platform settings (gateway mode)
@@ -646,6 +668,21 @@ DEFAULT_CONFIG = {
         # Default (None) uses the built-in "⚕ *Hermes Agent*" header.
         # Set to "" (empty string) to disable the header entirely.
         # Supports \n for newlines, e.g. "🤖 *My Bot*\n──────\n"
+    },
+
+    # Telegram platform settings (gateway mode)
+    "telegram": {
+        "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
+    },
+
+    # Slack platform settings (gateway mode)
+    "slack": {
+        "channel_prompts": {},         # Per-channel ephemeral system prompts
+    },
+
+    # Mattermost platform settings (gateway mode)
+    "mattermost": {
+        "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
 
     # Approval mode for dangerous commands:
@@ -703,7 +740,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 17,
+    "_config_version": 18,
 }
 
 # =============================================================================
@@ -969,6 +1006,22 @@ OPTIONAL_ENV_VARS = {
     "XIAOMI_BASE_URL": {
         "description": "Xiaomi MiMo base URL override (default: https://api.xiaomimimo.com/v1)",
         "prompt": "Xiaomi base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "AWS_REGION": {
+        "description": "AWS region for Bedrock API calls (e.g. us-east-1, eu-central-1)",
+        "prompt": "AWS Region",
+        "url": "https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-regions.html",
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "AWS_PROFILE": {
+        "description": "AWS named profile for Bedrock authentication (from ~/.aws/credentials)",
+        "prompt": "AWS Profile",
         "url": None,
         "password": False,
         "category": "provider",
@@ -2766,6 +2819,47 @@ def sanitize_env_file() -> int:
     return fixes
 
 
+def _check_non_ascii_credential(key: str, value: str) -> str:
+    """Warn and strip non-ASCII characters from credential values.
+
+    API keys and tokens must be pure ASCII — they are sent as HTTP header
+    values which httpx/httpcore encode as ASCII.  Non-ASCII characters
+    (commonly introduced by copy-pasting from rich-text editors or PDFs
+    that substitute lookalike Unicode glyphs for ASCII letters) cause
+    ``UnicodeEncodeError: 'ascii' codec can't encode character`` at
+    request time.
+
+    Returns the sanitized (ASCII-only) value.  Prints a warning if any
+    non-ASCII characters were found and removed.
+    """
+    try:
+        value.encode("ascii")
+        return value  # all ASCII — nothing to do
+    except UnicodeEncodeError:
+        pass
+
+    # Build a readable list of the offending characters
+    bad_chars: list[str] = []
+    for i, ch in enumerate(value):
+        if ord(ch) > 127:
+            bad_chars.append(f"  position {i}: {ch!r} (U+{ord(ch):04X})")
+    sanitized = value.encode("ascii", errors="ignore").decode("ascii")
+
+    import sys
+    print(
+        f"\n  Warning: {key} contains non-ASCII characters that will break API requests.\n"
+        f"  This usually happens when copy-pasting from a PDF, rich-text editor,\n"
+        f"  or web page that substitutes lookalike Unicode glyphs for ASCII letters.\n"
+        f"\n"
+        + "\n".join(f"  {line}" for line in bad_chars[:5])
+        + ("\n  ... and more" if len(bad_chars) > 5 else "")
+        + f"\n\n  The non-ASCII characters have been stripped automatically.\n"
+        f"  If authentication fails, re-copy the key from the provider's dashboard.\n",
+        file=sys.stderr,
+    )
+    return sanitized
+
+
 def save_env_value(key: str, value: str):
     """Save or update a value in ~/.hermes/.env."""
     if is_managed():
@@ -2774,6 +2868,8 @@ def save_env_value(key: str, value: str):
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     value = value.replace("\n", "").replace("\r", "")
+    # API keys / tokens must be ASCII — strip non-ASCII with a warning.
+    value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()
     env_path = get_env_path()
     
