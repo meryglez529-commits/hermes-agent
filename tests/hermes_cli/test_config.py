@@ -410,6 +410,30 @@ class TestOptionalEnvVarsRegistry:
             all_vars.extend(vars_list)
         assert "TAVILY_API_KEY" in all_vars
 
+    def test_soulstore_provider_vars_registered(self):
+        """SoulStore gateway env vars are exposed as provider settings."""
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+
+        expected = {
+            "SOULSTORE_KEY": True,
+            "SOULSTORE_BASE_URL": False,
+            "SOULSTORE_INSTANCE_ID": False,
+            "SOULSTORE_SOURCE_TYPE": False,
+        }
+        for name, is_password in expected.items():
+            assert name in OPTIONAL_ENV_VARS
+            assert OPTIONAL_ENV_VARS[name]["category"] == "provider"
+            assert OPTIONAL_ENV_VARS[name]["password"] is is_password
+
+    def test_soulstore_vars_are_known_extra_env_keys(self):
+        """SoulStore vars stay whitelisted for .env sanitization flows."""
+        from hermes_cli.config import _EXTRA_ENV_KEYS
+
+        assert "SOULSTORE_KEY" in _EXTRA_ENV_KEYS
+        assert "SOULSTORE_BASE_URL" in _EXTRA_ENV_KEYS
+        assert "SOULSTORE_INSTANCE_ID" in _EXTRA_ENV_KEYS
+        assert "SOULSTORE_SOURCE_TYPE" in _EXTRA_ENV_KEYS
+
 
 class TestAnthropicTokenMigration:
     """Test that config version 8→9 clears ANTHROPIC_TOKEN."""

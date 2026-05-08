@@ -132,10 +132,10 @@ class TestDefaultContextLengths:
             if "gpt-4.1" in key:
                 assert value == 1047576, f"{key} should be 1047576"
 
-    def test_gemini_models_1m(self):
+    def test_gemini_models_1_5m(self):
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
             if "gemini" in key:
-                assert value == 1048576, f"{key} should be 1048576"
+                assert value == 1500000, f"{key} should be 1500000"
 
     def test_grok_models_context_lengths(self):
         # xAI /v1/models does not return context_length metadata, so

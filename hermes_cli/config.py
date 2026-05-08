@@ -90,6 +90,7 @@ _EXTRA_ENV_KEYS = frozenset({
     "MATRIX_PASSWORD", "MATRIX_ENCRYPTION", "MATRIX_DEVICE_ID", "MATRIX_HOME_ROOM",
     "MATRIX_REQUIRE_MENTION", "MATRIX_FREE_RESPONSE_ROOMS", "MATRIX_AUTO_THREAD", "MATRIX_DM_AUTO_THREAD",
     "MATRIX_RECOVERY_KEY",
+    "SOULSTORE_BASE_URL", "SOULSTORE_KEY", "SOULSTORE_INSTANCE_ID", "SOULSTORE_SOURCE_TYPE",
     # Langfuse observability plugin — optional tuning keys + standard SDK vars.
     # Activation is via plugins.enabled (opt-in through `hermes plugins enable
     # observability/langfuse` or `hermes tools → Langfuse`); credentials gate
@@ -1412,6 +1413,38 @@ OPTIONAL_ENV_VARS = {
     "NOUS_BASE_URL": {
         "description": "Nous Portal base URL override",
         "prompt": "Nous Portal base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "SOULSTORE_KEY": {
+        "description": "SoulStore LLM gateway API key (use as model api_key with custom base_url)",
+        "prompt": "SoulStore API key",
+        "url": None,
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "SOULSTORE_BASE_URL": {
+        "description": "SoulStore OpenAI-compatible gateway base URL (must match model.base_url)",
+        "prompt": "SoulStore base URL",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "SOULSTORE_INSTANCE_ID": {
+        "description": "SoulStore instance ID (enables X-SoulStore-* headers on requests)",
+        "prompt": "SoulStore instance ID",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "SOULSTORE_SOURCE_TYPE": {
+        "description": "SoulStore X-SoulStore-Source-Type header (default: openclaw)",
+        "prompt": "SoulStore source type",
         "url": None,
         "password": False,
         "category": "provider",
