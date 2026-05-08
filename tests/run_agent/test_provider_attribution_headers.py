@@ -84,6 +84,32 @@ def test_unknown_base_url_clears_default_headers(mock_openai):
 
 
 @patch("run_agent.OpenAI")
+def test_soulstore_base_url_applies_default_headers(mock_openai, monkeypatch):
+    mock_openai.return_value = MagicMock()
+    monkeypatch.setenv("SOULSTORE_INSTANCE_ID", "instance-3")
+    monkeypatch.setenv("SOULSTORE_BASE_URL", "https://soulstore.example.com/api/v1")
+    monkeypatch.setenv("SOULSTORE_SOURCE_TYPE", "openclaw")
+    monkeypatch.setenv("SOULSTORE_KEY", "sk-soulstore")
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://soulstore.example.com/api/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url("https://soulstore.example.com/api/v1")
+
+    assert agent._client_kwargs["default_headers"] == {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer sk-soulstore",
+        "X-SoulStore-Source-Type": "openclaw",
+        "X-SoulStore-Instance-Id": "instance-3",
+    }
+
+
+@patch("run_agent.OpenAI")
 def test_openrouter_headers_include_response_cache_when_enabled(mock_openai):
     """When openrouter.response_cache is True, the cache header is injected."""
     mock_openai.return_value = MagicMock()

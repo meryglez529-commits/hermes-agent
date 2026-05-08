@@ -150,6 +150,38 @@ class TestResolveProviderClientNamedCustom:
         # Should use _read_main_model() fallback
         assert model == "main-model"
 
+    def test_named_custom_provider_merges_soulstore_headers(self, monkeypatch, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "main-model"},
+            "custom_providers": [
+                {
+                    "name": "beans",
+                    "base_url": "https://soulstore.example.com/api/v1",
+                    "api_key": "k",
+                },
+            ],
+        })
+        monkeypatch.setenv("SOULSTORE_INSTANCE_ID", "instance-2")
+        monkeypatch.setenv("SOULSTORE_BASE_URL", "https://soulstore.example.com/api/v1")
+        monkeypatch.setenv("SOULSTORE_SOURCE_TYPE", "openclaw")
+        monkeypatch.setenv("SOULSTORE_KEY", "sk-soulstore")
+
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            from agent.auxiliary_client import resolve_provider_client
+
+            client, model = resolve_provider_client("beans", "my-model")
+
+        assert client is not None
+        assert model == "my-model"
+        headers = mock_openai.call_args.kwargs["default_headers"]
+        assert headers == {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-soulstore",
+            "X-SoulStore-Source-Type": "openclaw",
+            "X-SoulStore-Instance-Id": "instance-2",
+        }
+
     def test_named_custom_no_api_key_uses_fallback(self, tmp_path):
         _write_config(tmp_path, {
             "model": {"default": "test"},

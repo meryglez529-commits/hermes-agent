@@ -565,6 +565,34 @@ class TestGetTextAuxiliaryClient:
         assert mock_openai.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
         assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
 
+    def test_custom_endpoint_merges_soulstore_headers(self, monkeypatch):
+        monkeypatch.setenv("SOULSTORE_INSTANCE_ID", "instance-1")
+        monkeypatch.setenv("SOULSTORE_BASE_URL", "https://soulstore.example.com/api/v1")
+        monkeypatch.setenv("SOULSTORE_SOURCE_TYPE", "openclaw")
+        monkeypatch.setenv("SOULSTORE_KEY", "sk-soulstore")
+
+        with patch(
+            "agent.auxiliary_client._resolve_custom_runtime",
+            return_value=("https://soulstore.example.com/api/v1", "sk-test", None),
+        ), patch(
+            "agent.auxiliary_client._read_main_model",
+            return_value="gpt-4o-mini",
+        ), patch(
+            "agent.auxiliary_client.OpenAI"
+        ) as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = get_text_auxiliary_client()
+
+        assert client is not None
+        assert model == "gpt-4o-mini"
+        headers = mock_openai.call_args.kwargs["default_headers"]
+        assert headers == {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-soulstore",
+            "X-SoulStore-Source-Type": "openclaw",
+            "X-SoulStore-Instance-Id": "instance-1",
+        }
+
 
 class TestVisionClientFallback:
     """Vision client auto mode resolves known-good multimodal backends."""

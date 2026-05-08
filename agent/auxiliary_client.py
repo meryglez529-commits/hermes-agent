@@ -1032,6 +1032,22 @@ def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
     return False
 
 
+def _merge_openai_kwargs_soulstore(base_url: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Merge SoulStore gateway headers into OpenAI client kwargs when configured."""
+    try:
+        from agent.soulstore_gateway import soulstore_default_headers
+    except ImportError:
+        return kwargs
+    headers = soulstore_default_headers(base_url)
+    if not headers:
+        return kwargs
+    merged = dict(kwargs)
+    existing = dict(merged.get("default_headers") or {})
+    existing.update(headers)
+    merged["default_headers"] = existing
+    return merged
+
+
 def _maybe_wrap_anthropic(
     client_obj: Any,
     model: str,
@@ -1593,7 +1609,11 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
     _clean_base, _dq = _extract_url_query_params(custom_base)
     _extra = {"default_query": _dq} if _dq else {}
     if custom_mode == "codex_responses":
-        real_client = OpenAI(api_key=custom_key, base_url=_clean_base, **_extra)
+        _kwargs = _merge_openai_kwargs_soulstore(
+            custom_base,
+            {"api_key": custom_key, "base_url": _clean_base, **_extra},
+        )
+        real_client = OpenAI(**_kwargs)
         return CodexAuxiliaryClient(real_client, model), model
     if custom_mode == "anthropic_messages":
         # Third-party Anthropic-compatible gateway (MiniMax, Zhipu GLM,
@@ -1607,14 +1627,22 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
                 "Custom endpoint declares api_mode=anthropic_messages but the "
                 "anthropic SDK is not installed — falling back to OpenAI-wire."
             )
-            return OpenAI(api_key=custom_key, base_url=_clean_base, **_extra), model
+            _kwargs = _merge_openai_kwargs_soulstore(
+                custom_base,
+                {"api_key": custom_key, "base_url": _clean_base, **_extra},
+            )
+            return OpenAI(**_kwargs), model
         return (
             AnthropicAuxiliaryClient(real_client, model, custom_key, custom_base, is_oauth=False),
             model,
         )
     # URL-based anthropic detection for custom endpoints that didn't set
     # api_mode explicitly (e.g. kimi.com/coding reached via custom config).
-    _fallback_client = OpenAI(api_key=custom_key, base_url=_clean_base, **_extra)
+    _kwargs = _merge_openai_kwargs_soulstore(
+        custom_base,
+        {"api_key": custom_key, "base_url": _clean_base, **_extra},
+    )
+    _fallback_client = OpenAI(**_kwargs)
     _fallback_client = _maybe_wrap_anthropic(
         _fallback_client, model, custom_key, custom_base, custom_mode,
     )
@@ -2368,7 +2396,11 @@ def resolve_provider_client(
                 extra["default_headers"] = copilot_request_headers(
                     is_agent_turn=True, is_vision=is_vision
                 )
-            client = OpenAI(api_key=custom_key, base_url=_clean_base, **extra)
+            _kwargs = _merge_openai_kwargs_soulstore(
+                explicit_base_url,
+                {"api_key": custom_key, "base_url": _clean_base, **extra},
+            )
+            client = OpenAI(**_kwargs)
             client = _wrap_if_needed(client, final_model, custom_base, custom_key)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
@@ -2455,7 +2487,11 @@ def resolve_provider_client(
                         _fallback_base = _to_openai_base_url(custom_base)
                         _fb_clean, _fb_dq = _extract_url_query_params(_fallback_base)
                         _fb_extra = {"default_query": _fb_dq} if _fb_dq else {}
-                        client = OpenAI(api_key=custom_key, base_url=_fb_clean, **_fb_extra)
+                        _kwargs = _merge_openai_kwargs_soulstore(
+                            custom_base,
+                            {"api_key": custom_key, "base_url": _fb_clean, **_fb_extra},
+                        )
+                        client = OpenAI(**_kwargs)
                         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                                 else (client, final_model))
                     sync_anthropic = AnthropicAuxiliaryClient(
@@ -2464,7 +2500,11 @@ def resolve_provider_client(
                     if async_mode:
                         return AsyncAnthropicAuxiliaryClient(sync_anthropic), final_model
                     return sync_anthropic, final_model
-                client = OpenAI(api_key=custom_key, base_url=_clean_base2, **_extra2)
+                _kwargs = _merge_openai_kwargs_soulstore(
+                    custom_base,
+                    {"api_key": custom_key, "base_url": _clean_base2, **_extra2},
+                )
+                client = OpenAI(**_kwargs)
                 # codex_responses or inherited auto-detect (via _wrap_if_needed).
                 # _wrap_if_needed reads the closed-over `api_mode` (the task-level
                 # override). Named-provider entry api_mode=codex_responses also

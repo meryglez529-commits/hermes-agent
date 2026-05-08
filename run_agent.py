@@ -57,6 +57,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 from datetime import datetime
 from pathlib import Path
 
+from agent.soulstore_gateway import soulstore_default_headers as _soulstore_default_headers
 from hermes_constants import get_hermes_home
 
 
@@ -1464,16 +1465,20 @@ class AIAgent:
                     from agent.auxiliary_client import _codex_cloudflare_headers
                     client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
                 elif "default_headers" not in client_kwargs:
-                    # Fall back to profile.default_headers for providers that
-                    # declare custom headers (e.g. Vercel AI Gateway attribution,
-                    # Kimi User-Agent on non-kimi.com endpoints).
-                    try:
-                        from providers import get_provider_profile as _gpf
-                        _ph = _gpf(self.provider)
-                        if _ph and _ph.default_headers:
-                            client_kwargs["default_headers"] = dict(_ph.default_headers)
-                    except Exception:
-                        pass
+                    _ss_headers = _soulstore_default_headers(base_url)
+                    if _ss_headers is not None:
+                        client_kwargs["default_headers"] = _ss_headers
+                    else:
+                        # Fall back to profile.default_headers for providers that
+                        # declare custom headers (e.g. Vercel AI Gateway attribution,
+                        # Kimi User-Agent on non-kimi.com endpoints).
+                        try:
+                            from providers import get_provider_profile as _gpf
+                            _ph = _gpf(self.provider)
+                            if _ph and _ph.default_headers:
+                                client_kwargs["default_headers"] = dict(_ph.default_headers)
+                        except Exception:
+                            pass
             else:
                 # No explicit creds — use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
@@ -1489,6 +1494,11 @@ class AIAgent:
                     # Preserve any default_headers the router set
                     if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
                         client_kwargs["default_headers"] = dict(_routed_client._default_headers)
+                    _ss_headers = _soulstore_default_headers(str(_routed_client.base_url))
+                    if _ss_headers is not None:
+                        _merged_headers = dict(client_kwargs.get("default_headers") or {})
+                        _merged_headers.update(_ss_headers)
+                        client_kwargs["default_headers"] = _merged_headers
                 else:
                     # When the user explicitly chose a non-OpenRouter provider
                     # but no credentials were found, fail fast with a clear
@@ -6478,19 +6488,23 @@ class AIAgent:
                 self._client_kwargs.get("api_key", "")
             )
         else:
-            # No URL-specific headers — check profile.default_headers before clearing.
-            _ph_headers = None
-            try:
-                from providers import get_provider_profile as _gpf2
-                _ph2 = _gpf2(self.provider)
-                if _ph2 and _ph2.default_headers:
-                    _ph_headers = dict(_ph2.default_headers)
-            except Exception:
-                pass
-            if _ph_headers:
-                self._client_kwargs["default_headers"] = _ph_headers
+            _ss_headers = _soulstore_default_headers(base_url)
+            if _ss_headers is not None:
+                self._client_kwargs["default_headers"] = _ss_headers
             else:
-                self._client_kwargs.pop("default_headers", None)
+                # No URL-specific headers — check profile.default_headers before clearing.
+                _ph_headers = None
+                try:
+                    from providers import get_provider_profile as _gpf2
+                    _ph2 = _gpf2(self.provider)
+                    if _ph2 and _ph2.default_headers:
+                        _ph_headers = dict(_ph2.default_headers)
+                except Exception:
+                    pass
+                if _ph_headers:
+                    self._client_kwargs["default_headers"] = _ph_headers
+                else:
+                    self._client_kwargs.pop("default_headers", None)
 
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
