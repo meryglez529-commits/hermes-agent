@@ -753,6 +753,56 @@ def test_switch_model_resolves_user_provider_credentials(monkeypatch, tmp_path):
     assert result.error_message == ""
 
 
+def test_switch_model_explicit_user_provider_requires_providers_dict(monkeypatch, tmp_path):
+    """Regression: ``/model <m> --provider <user-key>`` must pass config ``providers:`` into switch_model.
+
+    CLI used to only load ``providers`` when opening the picker (no args), so
+    ``user_providers=None`` reached ``switch_model`` and produced Unknown provider.
+    """
+    import yaml
+
+    config = {
+        "providers": {
+            "soulstore-claude": {
+                "name": "SoulStore Claude",
+                "base_url": "https://example.com/api/v1",
+                "api_key": "sk-test",
+                "default_model": "anthropic/claude-sonnet-4.6",
+            }
+        }
+    }
+
+    (tmp_path / "config.yaml").write_text(yaml.dump(config), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: {"accepted": True, "persist": True, "recognized": True, "message": None},
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None)
+
+    missing = switch_model(
+        raw_input="anthropic/claude-sonnet-4.6",
+        current_provider="openrouter",
+        current_model="openai/gpt-4",
+        explicit_provider="soulstore-claude",
+        user_providers=None,
+    )
+    assert not missing.success
+    assert "Unknown provider" in (missing.error_message or "")
+
+    ok = switch_model(
+        raw_input="anthropic/claude-sonnet-4.6",
+        current_provider="openrouter",
+        current_model="openai/gpt-4",
+        explicit_provider="soulstore-claude",
+        user_providers=config["providers"],
+    )
+    assert ok.success, ok.error_message
+    assert ok.target_provider == "soulstore-claude"
+
+
 # =============================================================================
 # Regression: providers: dict ``transport`` field must be honored
 # =============================================================================
